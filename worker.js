@@ -37,9 +37,11 @@ const RSS_SOURCES = [
   }
 ];
 
-// KV 快取 TTL (秒) - 控制去重時間窗
-const KV_CACHE_TTL_SECONDS = 36 * 60 * 60; // 36 小時
-const MAX_ITEM_AGE_MS = 24 * 60 * 60 * 1000; // 1 天，過期文章不再推送
+// 時區與批次設定
+const TAIPEI_OFFSET_MS = 8 * 60 * 60 * 1000; // UTC+8
+const DAILY_TIMEZONE = 'Asia/Taipei';
+const MAX_ITEMS_PER_SEND = 5;
+const MAX_RSS_ITEMS = 50;
 
 function extractTagValue(content, tagName) {
   const escaped = tagName.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
@@ -80,12 +82,25 @@ export default {
  */
 async function processRSS(env, testMode = false) {
   try {
-    // 決定每個源要處理幾篇文章
-    const limitPerSource = testMode ? 1 : 5;
-    
-    // 遍歷所有 RSS 源
+    const kv = env.RSS_CACHE;
+    if (!kv) {
+      console.error('RSS_CACHE KV namespace 未綁定,無法執行每日聚合');
+      return;
+    }
+
+    const dateKey = getTaipeiDateKey(new Date());
+    const sendLimit = testMode ? 1 : MAX_ITEMS_PER_SEND;
+
     for (const source of RSS_SOURCES) {
       try {
+        const webhookUrl = env[source.webhookEnv];
+        if (!webhookUrl) {
+          console.error(`缺少 ${source.name} 的 Webhook 設定: ${source.webhookEnv}`);
+          continue;
+        }
+
+        const { key, state, exists } = await loadDailyState(kv, source, dateKey);
+
         // 抓取 RSS
         const response = await fetch(source.url);
         if (!response.ok) {
@@ -94,51 +109,43 @@ async function processRSS(env, testMode = false) {
         }
         
         const rssText = await response.text();
-        
-        // 解析 RSS (只處理需要的數量)
-        let items = await parseRSSItems(rssText, source, limitPerSource, env);
-        if (testMode && items.length > 1) {
-          items = items.slice(0, 1);
-        }
 
-        const webhookUrl = env[source.webhookEnv];
-        if (!webhookUrl) {
-          console.error(`Missing webhook env for ${source.name}: ${source.webhookEnv}`);
-          continue;
-        }
+        const parsedItems = await parseRSSItems(rssText, source, dateKey);
+        const { articles, hasChanges } = mergeArticles(state.articles, parsedItems);
 
-        const freshItems = [];
-        for (const item of items) {
-          if (!item.link) {
-            continue;
+        // 尋找尚未發送的文章 (由舊到新)
+        const unsentQueue = articles.filter(article => !article.sent);
+        const toSend = unsentQueue.slice(0, sendLimit);
+
+        let sendSuccess = false;
+        if (toSend.length) {
+          let successCount = 0;
+
+          for (const article of toSend) {
+            const sent = await sendToDiscord(webhookUrl, article, source);
+            if (sent) {
+              article.sent = true;
+              article.sentAt = new Date().toISOString();
+              successCount += 1;
+              sendSuccess = true;
+            }
+            // 避免超過 Discord rate limit,每篇間隔 1 秒
+            await sleep(1000);
           }
 
-          const processed = await hasProcessedLink(env, item.link);
-          if (processed) {
-            continue;
-          }
-
-          freshItems.push(item);
+          console.log(`Successfully sent ${successCount}/${toSend.length} items for ${source.name}${testMode ? ' (test mode)' : ''}`);
+        } else {
+          console.log(`No pending items to send for ${source.name}`);
         }
 
-        if (!freshItems.length) {
-          console.log(`No new items for ${source.name}`);
-          continue;
+        if (hasChanges || sendSuccess || !exists) {
+          const nextState = {
+            ...state,
+            articles,
+            updatedAt: new Date().toISOString()
+          };
+          await saveDailyState(kv, key, nextState);
         }
-        
-        // 推送到 Discord
-        let successCount = 0;
-        for (const item of freshItems) {
-          const sent = await sendToDiscord(webhookUrl, item);
-          if (sent) {
-            await markLinkProcessed(env, item.link);
-            successCount += 1;
-          }
-          // 避免超過 Discord rate limit,每篇間隔 1 秒
-          await sleep(1000);
-        }
-        
-        console.log(`Successfully processed ${successCount}/${freshItems.length} items from ${source.name}${testMode ? ' (test mode)' : ''}`);
       } catch (error) {
         console.error(`Error processing ${source.name}:`, error);
         // 繼續處理下一個源
@@ -156,13 +163,13 @@ async function processRSS(env, testMode = false) {
  * @param {number} limit - 限制處理的文章數量
  * @param {Object} env - 環境變數 (用於 KV 去重)
  */
-async function parseRSSItems(rssXml, source, limit = 5, env) {
+async function parseRSSItems(rssXml, source, targetDateKey) {
   const items = [];
   const seenLinks = new Set();
   const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
 
   for (const match of rssXml.matchAll(itemRegex)) {
-    if (items.length >= limit) {
+    if (items.length >= MAX_RSS_ITEMS) {
       break;
     }
 
@@ -175,7 +182,13 @@ async function parseRSSItems(rssXml, source, limit = 5, env) {
       extractTagValue(itemContent, 'content:encoded') ||
       extractTagValue(itemContent, 'encoded');
 
-    if (!isFreshPubDate(pubDate)) {
+    const publishedAt = parsePubDate(pubDate);
+    if (!publishedAt) {
+      continue;
+    }
+
+    const itemDateKey = getTaipeiDateKey(publishedAt);
+    if (itemDateKey !== targetDateKey) {
       continue;
     }
 
@@ -184,17 +197,6 @@ async function parseRSSItems(rssXml, source, limit = 5, env) {
     }
     if (link) {
       seenLinks.add(link);
-
-      if (env) {
-        try {
-          const processed = await hasProcessedLink(env, link);
-          if (processed) {
-            continue;
-          }
-        } catch (error) {
-          console.error('Pre-parse KV check failed:', error);
-        }
-      }
     }
 
     let thumbnail = null;
@@ -214,11 +216,11 @@ async function parseRSSItems(rssXml, source, limit = 5, env) {
 
     items.push({
       title,
-      description: cleanHtml(descriptionHtml),
+      description: cleanHtml(descriptionHtml || ''),
       link,
-      pubDate,
       thumbnail,
-      source
+      publishedAt: publishedAt.toISOString(),
+      publishedAtMs: publishedAt.getTime()
     });
   }
   
@@ -360,37 +362,191 @@ function cleanHtml(html) {
   return text;
 }
 
-function isFreshPubDate(pubDate) {
+function parsePubDate(pubDate) {
   if (!pubDate) {
-    return true;
+    return null;
   }
 
   const publishedAt = new Date(pubDate);
-  if (Number.isNaN(publishedAt.getTime())) {
-    return true;
-  }
-
-  const age = Date.now() - publishedAt.getTime();
-  if (age < 0) {
-    return true;
-  }
-
-  return age <= MAX_ITEM_AGE_MS;
+  const time = publishedAt.getTime();
+  return Number.isNaN(time) ? null : publishedAt;
 }
+
+function getTaipeiDateKey(date) {
+  const timestamp = date.getTime();
+  const taipeiTime = new Date(timestamp + TAIPEI_OFFSET_MS);
+  const year = taipeiTime.getUTCFullYear();
+  const month = String(taipeiTime.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(taipeiTime.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function buildDailyKey(source, dateKey) {
+  const identifier = source.webhookEnv || source.url || source.name;
+  return `daily:${encodeURIComponent(identifier)}:${dateKey}`;
+}
+
+async function loadDailyState(kv, source, dateKey) {
+  const key = buildDailyKey(source, dateKey);
+  const emptyState = {
+    sourceName: source.name,
+    sourceUrl: source.url,
+    sourceId: source.webhookEnv || source.url,
+    dateKey,
+    timezone: DAILY_TIMEZONE,
+    articles: [],
+    updatedAt: new Date().toISOString()
+  };
+
+  try {
+    const raw = await kv.get(key);
+    if (!raw) {
+      return { key, exists: false, state: emptyState };
+    }
+
+    const data = JSON.parse(raw);
+    const rawArticles = Array.isArray(data.articles) ? data.articles : [];
+
+    const articles = rawArticles
+      .map(entry => {
+        if (!entry || !entry.link) {
+          return null;
+        }
+
+        const publishedAtMs = Number.isFinite(entry.publishedAtMs)
+          ? Number(entry.publishedAtMs)
+          : (entry.publishedAt ? Date.parse(entry.publishedAt) : null);
+
+        return {
+          link: entry.link,
+          title: entry.title || 'No Title',
+          description: entry.description || '',
+          thumbnail: entry.thumbnail || null,
+          publishedAt: typeof entry.publishedAt === 'string' ? entry.publishedAt : (publishedAtMs ? new Date(publishedAtMs).toISOString() : null),
+          publishedAtMs: Number.isFinite(publishedAtMs) ? publishedAtMs : null,
+          sent: Boolean(entry.sent),
+          sentAt: typeof entry.sentAt === 'string' ? entry.sentAt : null
+        };
+      })
+      .filter(Boolean);
+
+    return {
+      key,
+      exists: true,
+      state: {
+        sourceName: data.sourceName || source.name,
+        sourceUrl: data.sourceUrl || source.url,
+        sourceId: data.sourceId || source.webhookEnv || source.url,
+        dateKey,
+        timezone: data.timezone || DAILY_TIMEZONE,
+        articles,
+        updatedAt: data.updatedAt || new Date().toISOString()
+      }
+    };
+  } catch (error) {
+    console.error(`讀取每日 KV 資料失敗 (${source.name}):`, error);
+    return { key, exists: false, state: emptyState };
+  }
+}
+
+async function saveDailyState(kv, key, state) {
+  try {
+    await kv.put(key, JSON.stringify(state));
+  } catch (error) {
+    console.error('寫入每日 KV 資料失敗:', error);
+  }
+}
+
+function mergeArticles(existingArticles, newItems) {
+  const articleMap = new Map();
+  for (const article of existingArticles) {
+    if (!article.link) {
+      continue;
+    }
+    articleMap.set(article.link, {
+      ...article,
+      sent: Boolean(article.sent),
+      sentAt: article.sentAt || null,
+      publishedAtMs: Number.isFinite(article.publishedAtMs) ? article.publishedAtMs : (article.publishedAt ? Date.parse(article.publishedAt) : null),
+      publishedAt: article.publishedAt || (article.publishedAtMs ? new Date(article.publishedAtMs).toISOString() : null)
+    });
+  }
+
+  let hasChanges = false;
+
+  for (const item of newItems) {
+    if (!item.link) {
+      continue;
+    }
+
+    const existing = articleMap.get(item.link);
+    if (existing) {
+      let updated = false;
+      const next = { ...existing };
+
+      if (item.title && item.title !== existing.title) {
+        next.title = item.title;
+        updated = true;
+      }
+      if (item.description && item.description !== existing.description) {
+        next.description = item.description;
+        updated = true;
+      }
+      if (item.thumbnail && item.thumbnail !== existing.thumbnail) {
+        next.thumbnail = item.thumbnail;
+        updated = true;
+      }
+      if (item.publishedAt && item.publishedAt !== existing.publishedAt) {
+        next.publishedAt = item.publishedAt;
+        next.publishedAtMs = item.publishedAtMs;
+        updated = true;
+      }
+
+      if (updated) {
+        articleMap.set(item.link, next);
+        hasChanges = true;
+      }
+    } else {
+      articleMap.set(item.link, {
+        link: item.link,
+        title: item.title,
+        description: item.description,
+        thumbnail: item.thumbnail,
+        publishedAt: item.publishedAt,
+        publishedAtMs: item.publishedAtMs,
+        sent: false,
+        sentAt: null
+      });
+      hasChanges = true;
+    }
+  }
+
+  const articles = Array.from(articleMap.values()).sort((a, b) => {
+    const aTime = Number.isFinite(a.publishedAtMs) ? a.publishedAtMs : Number.POSITIVE_INFINITY;
+    const bTime = Number.isFinite(b.publishedAtMs) ? b.publishedAtMs : Number.POSITIVE_INFINITY;
+    if (aTime !== bTime) {
+      return aTime - bTime;
+    }
+    return a.link.localeCompare(b.link);
+  });
+
+  return { articles, hasChanges };
+}
+
 
 /**
  * 推送訊息到 Discord
  */
-async function sendToDiscord(webhookUrl, item) {
+async function sendToDiscord(webhookUrl, item, source) {
   // 建立 embed 物件
   const embed = {
     title: item.title,
     description: item.description,
     url: item.link,
-    color: item.source.color,  // 使用來源的顏色
-    timestamp: item.pubDate ? new Date(item.pubDate).toISOString() : new Date().toISOString(),
+    color: source.color,  // 使用來源的顏色
+    timestamp: item.publishedAt || new Date().toISOString(),
     footer: {
-      text: item.source.name  // 顯示來源名稱
+      text: source.name  // 顯示來源名稱
     }
   };
   
@@ -427,42 +583,4 @@ async function sendToDiscord(webhookUrl, item) {
  */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * 檢查是否是近期已處理過的連結
- */
-async function hasProcessedLink(env, link) {
-  const kv = env.RSS_CACHE;
-  if (!kv) {
-    console.error('RSS_CACHE KV namespace 未綁定,跳過去重檢查');
-    return false;
-  }
-
-  const cacheKey = buildCacheKey(link);
-  try {
-    const cached = await kv.get(cacheKey);
-    return Boolean(cached);
-  } catch (error) {
-    console.error('讀取 RSS_CACHE 時發生錯誤:', error);
-    return false;
-  }
-}
-
-async function markLinkProcessed(env, link) {
-  const kv = env.RSS_CACHE;
-  if (!kv) {
-    return;
-  }
-
-  const cacheKey = buildCacheKey(link);
-  try {
-    await kv.put(cacheKey, '1', { expirationTtl: KV_CACHE_TTL_SECONDS });
-  } catch (error) {
-    console.error('寫入 RSS_CACHE 時發生錯誤:', error);
-  }
-}
-
-function buildCacheKey(link) {
-  return `link:${encodeURIComponent(link)}`;
 }
