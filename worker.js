@@ -10,8 +10,10 @@
  * 1. Environment Variables:
  *    - DISCORD_WEBHOOK_GNN: 巴哈姆特用 Webhook URL
  *    - DISCORD_WEBHOOK_4GAMERS: 4Gamers 用 Webhook URL
- * 
- * 2. Workers Cron Triggers (在 Cloudflare Dashboard 設定):
+ * 2. KV Namespace Bindings:
+ *    - RSS_CACHE: 儲存已處理的文章連結,避免重複推送
+ *
+ * 3. Workers Cron Triggers (在 Cloudflare Dashboard 設定):
  *    - 在 Triggers > Cron Triggers 新增: 0 * * * *  (每小時執行一次)
  */
 
@@ -35,9 +37,9 @@ const RSS_SOURCES = [
   }
 ];
 
-// 近期已處理連結快取，避免短時間重複推送
-const RECENT_LINK_CACHE = new Map();
-const RECENT_LINK_TTL_MS = 10 * 60 * 1000; // 10 分鐘
+// KV 快取 TTL (秒) - 控制去重時間窗
+const KV_CACHE_TTL_SECONDS = 36 * 60 * 60; // 36 小時
+const MAX_ITEM_AGE_MS = 24 * 60 * 60 * 1000; // 1 天，過期文章不再推送
 
 function extractTagValue(content, tagName) {
   const escaped = tagName.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
@@ -83,8 +85,6 @@ async function processRSS(env, testMode = false) {
     
     // 遍歷所有 RSS 源
     for (const source of RSS_SOURCES) {
-      console.log(`Processing RSS source: ${source.name}`);
-      
       try {
         // 抓取 RSS
         const response = await fetch(source.url);
@@ -96,29 +96,30 @@ async function processRSS(env, testMode = false) {
         const rssText = await response.text();
         
         // 解析 RSS (只處理需要的數量)
-        let items = await parseRSSItems(rssText, source, limitPerSource);
-        console.log(`Items parsed for ${source.name}: ${items.length}`);
+        let items = await parseRSSItems(rssText, source, limitPerSource, env);
         if (testMode && items.length > 1) {
           items = items.slice(0, 1);
         }
 
         const webhookUrl = env[source.webhookEnv];
         if (!webhookUrl) {
-          console.warn(`Missing webhook env for ${source.name}: ${source.webhookEnv}`);
+          console.error(`Missing webhook env for ${source.name}: ${source.webhookEnv}`);
           continue;
         }
 
-        const freshItems = items.filter(item => {
+        const freshItems = [];
+        for (const item of items) {
           if (!item.link) {
-            console.warn(`Skip item without link from ${source.name}`);
-            return false;
+            continue;
           }
-          if (isRecentlyProcessed(item.link)) {
-            console.log(`Skip duplicate item (recent cache): ${item.link}`);
-            return false;
+
+          const processed = await hasProcessedLink(env, item.link);
+          if (processed) {
+            continue;
           }
-          return true;
-        });
+
+          freshItems.push(item);
+        }
 
         if (!freshItems.length) {
           console.log(`No new items for ${source.name}`);
@@ -126,13 +127,18 @@ async function processRSS(env, testMode = false) {
         }
         
         // 推送到 Discord
+        let successCount = 0;
         for (const item of freshItems) {
-          await sendToDiscord(webhookUrl, item);
+          const sent = await sendToDiscord(webhookUrl, item);
+          if (sent) {
+            await markLinkProcessed(env, item.link);
+            successCount += 1;
+          }
           // 避免超過 Discord rate limit,每篇間隔 1 秒
           await sleep(1000);
         }
         
-        console.log(`Successfully processed ${freshItems.length} items from ${source.name}${testMode ? ' (test mode)' : ''}`);
+        console.log(`Successfully processed ${successCount}/${freshItems.length} items from ${source.name}${testMode ? ' (test mode)' : ''}`);
       } catch (error) {
         console.error(`Error processing ${source.name}:`, error);
         // 繼續處理下一個源
@@ -148,8 +154,9 @@ async function processRSS(env, testMode = false) {
  * @param {string} rssXml - RSS XML 內容
  * @param {Object} source - RSS 源資訊
  * @param {number} limit - 限制處理的文章數量
+ * @param {Object} env - 環境變數 (用於 KV 去重)
  */
-async function parseRSSItems(rssXml, source, limit = 5) {
+async function parseRSSItems(rssXml, source, limit = 5, env) {
   const items = [];
   const seenLinks = new Set();
   const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
@@ -168,11 +175,26 @@ async function parseRSSItems(rssXml, source, limit = 5) {
       extractTagValue(itemContent, 'content:encoded') ||
       extractTagValue(itemContent, 'encoded');
 
+    if (!isFreshPubDate(pubDate)) {
+      continue;
+    }
+
     if (link && seenLinks.has(link)) {
       continue;
     }
     if (link) {
       seenLinks.add(link);
+
+      if (env) {
+        try {
+          const processed = await hasProcessedLink(env, link);
+          if (processed) {
+            continue;
+          }
+        } catch (error) {
+          console.error('Pre-parse KV check failed:', error);
+        }
+      }
     }
 
     let thumbnail = null;
@@ -181,20 +203,12 @@ async function parseRSSItems(rssXml, source, limit = 5) {
       const mediaUrl = mediaMatch ? mediaMatch[1].trim() : '';
       if (mediaUrl) {
         thumbnail = mediaUrl;
-        console.log('Thumbnail from media:content:', thumbnail);
       } else if (descriptionHtml) {
         thumbnail = extractThumbnail(descriptionHtml, source.baseUrl);
-        if (thumbnail) {
-          console.log('Thumbnail from description:', thumbnail);
-        }
       } else if (contentHtml) {
         thumbnail = extractThumbnail(contentHtml, source.baseUrl);
-        if (thumbnail) {
-          console.log('Thumbnail from content:encoded:', thumbnail);
-        }
       }
     } else if (source.thumbnailStrategy === 'page' && link) {
-      console.log('Fetching article page for thumbnail:', link);
       thumbnail = await extractThumbnailFromPage(link, source.baseUrl);
     }
 
@@ -218,7 +232,6 @@ async function parseRSSItems(rssXml, source, limit = 5) {
  */
 async function extractThumbnailFromPage(url, baseUrl) {
   try {
-    console.log('Fetching article page:', url);
     const response = await fetch(url);
     
     if (!response.ok) {
@@ -250,11 +263,9 @@ async function extractThumbnailFromPage(url, baseUrl) {
         imgUrl = baseUrl + imgUrl;
       }
       
-      console.log('Thumbnail extracted from page:', imgUrl);
       return imgUrl;
     }
     
-    console.log('No image found in article page');
     return null;
   } catch (error) {
     console.error('Error extracting thumbnail from page:', error);
@@ -349,6 +360,24 @@ function cleanHtml(html) {
   return text;
 }
 
+function isFreshPubDate(pubDate) {
+  if (!pubDate) {
+    return true;
+  }
+
+  const publishedAt = new Date(pubDate);
+  if (Number.isNaN(publishedAt.getTime())) {
+    return true;
+  }
+
+  const age = Date.now() - publishedAt.getTime();
+  if (age < 0) {
+    return true;
+  }
+
+  return age <= MAX_ITEM_AGE_MS;
+}
+
 /**
  * 推送訊息到 Discord
  */
@@ -370,9 +399,6 @@ async function sendToDiscord(webhookUrl, item) {
     embed.image = {
       url: item.thumbnail
     };
-    console.log(`Thumbnail found: ${item.thumbnail}`);
-  } else {
-    console.log('No thumbnail found for:', item.title);
   }
   
   const payload = {
@@ -390,9 +416,10 @@ async function sendToDiscord(webhookUrl, item) {
   if (!response.ok) {
     const errorText = await response.text();
     console.error(`Failed to send to Discord: ${response.status} - ${errorText}`);
-  } else {
-    console.log(`Successfully sent to Discord: ${item.title}`);
+    return false;
   }
+
+  return true;
 }
 
 /**
@@ -405,24 +432,37 @@ function sleep(ms) {
 /**
  * 檢查是否是近期已處理過的連結
  */
-function isRecentlyProcessed(link) {
-  if (!link) {
+async function hasProcessedLink(env, link) {
+  const kv = env.RSS_CACHE;
+  if (!kv) {
+    console.error('RSS_CACHE KV namespace 未綁定,跳過去重檢查');
     return false;
   }
-  
-  const now = Date.now();
-  
-  // 清理過期快取
-  for (const [cachedLink, timestamp] of RECENT_LINK_CACHE) {
-    if (now - timestamp > RECENT_LINK_TTL_MS) {
-      RECENT_LINK_CACHE.delete(cachedLink);
-    }
+
+  const cacheKey = buildCacheKey(link);
+  try {
+    const cached = await kv.get(cacheKey);
+    return Boolean(cached);
+  } catch (error) {
+    console.error('讀取 RSS_CACHE 時發生錯誤:', error);
+    return false;
   }
-  
-  if (RECENT_LINK_CACHE.has(link)) {
-    return true;
+}
+
+async function markLinkProcessed(env, link) {
+  const kv = env.RSS_CACHE;
+  if (!kv) {
+    return;
   }
-  
-  RECENT_LINK_CACHE.set(link, now);
-  return false;
+
+  const cacheKey = buildCacheKey(link);
+  try {
+    await kv.put(cacheKey, '1', { expirationTtl: KV_CACHE_TTL_SECONDS });
+  } catch (error) {
+    console.error('寫入 RSS_CACHE 時發生錯誤:', error);
+  }
+}
+
+function buildCacheKey(link) {
+  return `link:${encodeURIComponent(link)}`;
 }
