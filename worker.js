@@ -42,6 +42,7 @@ const TAIPEI_OFFSET_MS = 8 * 60 * 60 * 1000; // UTC+8
 const DAILY_TIMEZONE = 'Asia/Taipei';
 const MAX_ITEMS_PER_SEND = 5;
 const MAX_RSS_ITEMS = 50;
+const SENT_MAP_TTL_SECONDS = 2 * 24 * 60 * 60;
 
 function extractTagValue(content, tagName) {
   const escaped = tagName.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
@@ -100,6 +101,8 @@ async function processRSS(env, testMode = false) {
         }
 
         const { key, state, exists } = await loadDailyState(kv, source, dateKey);
+        const { key: sentKey, map: sentMap } = await loadSentMap(kv, source);
+        let sentMapDirty = pruneSentMap(sentMap);
 
         // 抓取 RSS
         const response = await fetch(source.url);
@@ -112,6 +115,8 @@ async function processRSS(env, testMode = false) {
 
         const parsedItems = await parseRSSItems(rssText, source, dateKey);
         const { articles, hasChanges } = mergeArticles(state.articles, parsedItems);
+
+        const alreadySentUpdated = markPreviouslySentArticles(articles, sentMap);
 
         // 尋找尚未發送的文章 (由舊到新)
         const unsentQueue = articles.filter(article => !article.sent);
@@ -126,6 +131,9 @@ async function processRSS(env, testMode = false) {
             if (sent) {
               article.sent = true;
               article.sentAt = new Date().toISOString();
+              if (setSentEntry(sentMap, article)) {
+                sentMapDirty = true;
+              }
               successCount += 1;
               sendSuccess = true;
             }
@@ -138,13 +146,17 @@ async function processRSS(env, testMode = false) {
           console.log(`No pending items to send for ${source.name}`);
         }
 
-        if (hasChanges || sendSuccess || !exists) {
+        if (hasChanges || sendSuccess || alreadySentUpdated || !exists) {
           const nextState = {
             ...state,
             articles,
             updatedAt: new Date().toISOString()
           };
           await saveDailyState(kv, key, nextState);
+        }
+
+        if (sentMapDirty) {
+          await saveSentMap(kv, sentKey, sentMap);
         }
       } catch (error) {
         console.error(`Error processing ${source.name}:`, error);
@@ -178,6 +190,7 @@ async function parseRSSItems(rssXml, source, targetDateKey) {
     const descriptionHtml = extractTagValue(itemContent, 'description');
     const link = extractTagValue(itemContent, 'link');
     const pubDate = extractTagValue(itemContent, 'pubDate');
+    const guid = extractTagValue(itemContent, 'guid');
     const contentHtml =
       extractTagValue(itemContent, 'content:encoded') ||
       extractTagValue(itemContent, 'encoded');
@@ -218,6 +231,7 @@ async function parseRSSItems(rssXml, source, targetDateKey) {
       title,
       description: cleanHtml(descriptionHtml || ''),
       link,
+      guid,
       thumbnail,
       publishedAt: publishedAt.toISOString(),
       publishedAtMs: publishedAt.getTime()
@@ -386,6 +400,122 @@ function buildDailyKey(source, dateKey) {
   return `daily:${encodeURIComponent(identifier)}:${dateKey}`;
 }
 
+function buildSentCollectionKey(source) {
+  const identifier = source.webhookEnv || source.url || source.name;
+  return `sent:${encodeURIComponent(identifier)}`;
+}
+
+function getArticleIdentity(article) {
+  if (article.guid && typeof article.guid === 'string' && article.guid.trim()) {
+    return article.guid.trim();
+  }
+  if (article.link && typeof article.link === 'string' && article.link.trim()) {
+    return article.link.trim();
+  }
+  return null;
+}
+
+function hashIdentifier(input) {
+  const value = String(input);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+    hash >>>= 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+function setSentEntry(sentMap, article) {
+  const identity = getArticleIdentity(article);
+  if (!identity) {
+    return false;
+  }
+
+  const hash = hashIdentifier(identity);
+  const sentAt = typeof article.sentAt === 'string' ? article.sentAt : new Date().toISOString();
+  const prev = sentMap.get(hash);
+
+  if (prev && prev.sentAt === sentAt) {
+    return false;
+  }
+
+  sentMap.set(hash, {
+    sentAt,
+    identity
+  });
+
+  return true;
+}
+
+async function loadSentMap(kv, source) {
+  const key = buildSentCollectionKey(source);
+  const map = new Map();
+
+  try {
+    const raw = await kv.get(key);
+    if (!raw) {
+      return { key, map };
+    }
+
+    const data = JSON.parse(raw);
+    if (data && typeof data === 'object') {
+      for (const [hash, entry] of Object.entries(data)) {
+        if (!entry || typeof entry !== 'object') {
+          continue;
+        }
+        const sentAt = typeof entry.sentAt === 'string' ? entry.sentAt : null;
+        if (!sentAt) {
+          continue;
+        }
+        map.set(hash, {
+          sentAt,
+          identity: typeof entry.identity === 'string' ? entry.identity : null
+        });
+      }
+    }
+  } catch (error) {
+    console.error('讀取跨日去重資料失敗:', error);
+  }
+
+  return { key, map };
+}
+
+async function saveSentMap(kv, key, sentMap) {
+  const serializable = {};
+
+  for (const [hash, entry] of sentMap.entries()) {
+    serializable[hash] = entry;
+  }
+
+  try {
+    await kv.put(key, JSON.stringify(serializable), { expirationTtl: SENT_MAP_TTL_SECONDS });
+  } catch (error) {
+    console.error('寫入跨日去重資料失敗:', error);
+  }
+}
+
+function pruneSentMap(sentMap) {
+  const cutoffMs = Date.now() - (SENT_MAP_TTL_SECONDS * 1000);
+  let mutated = false;
+
+  for (const [hash, entry] of sentMap.entries()) {
+    if (!entry || typeof entry.sentAt !== 'string') {
+      sentMap.delete(hash);
+      mutated = true;
+      continue;
+    }
+
+    const timestamp = Date.parse(entry.sentAt);
+    if (!Number.isFinite(timestamp) || timestamp < cutoffMs) {
+      sentMap.delete(hash);
+      mutated = true;
+    }
+  }
+
+  return mutated;
+}
+
 async function loadDailyState(kv, source, dateKey) {
   const key = buildDailyKey(source, dateKey);
   const emptyState = {
@@ -422,6 +552,7 @@ async function loadDailyState(kv, source, dateKey) {
           title: entry.title || 'No Title',
           description: entry.description || '',
           thumbnail: entry.thumbnail || null,
+          guid: typeof entry.guid === 'string' ? entry.guid : null,
           publishedAt: typeof entry.publishedAt === 'string' ? entry.publishedAt : (publishedAtMs ? new Date(publishedAtMs).toISOString() : null),
           publishedAtMs: Number.isFinite(publishedAtMs) ? publishedAtMs : null,
           sent: Boolean(entry.sent),
@@ -459,15 +590,20 @@ async function saveDailyState(kv, key, state) {
 
 function mergeArticles(existingArticles, newItems) {
   const articleMap = new Map();
+
   for (const article of existingArticles) {
     if (!article.link) {
       continue;
     }
+
     articleMap.set(article.link, {
       ...article,
       sent: Boolean(article.sent),
       sentAt: article.sentAt || null,
-      publishedAtMs: Number.isFinite(article.publishedAtMs) ? article.publishedAtMs : (article.publishedAt ? Date.parse(article.publishedAt) : null),
+      guid: typeof article.guid === 'string' ? article.guid : null,
+      publishedAtMs: Number.isFinite(article.publishedAtMs)
+        ? article.publishedAtMs
+        : (article.publishedAt ? Date.parse(article.publishedAt) : null),
       publishedAt: article.publishedAt || (article.publishedAtMs ? new Date(article.publishedAtMs).toISOString() : null)
     });
   }
@@ -496,6 +632,10 @@ function mergeArticles(existingArticles, newItems) {
         next.thumbnail = item.thumbnail;
         updated = true;
       }
+      if (item.guid && item.guid !== existing.guid) {
+        next.guid = item.guid;
+        updated = true;
+      }
       if (item.publishedAt && item.publishedAt !== existing.publishedAt) {
         next.publishedAt = item.publishedAt;
         next.publishedAtMs = item.publishedAtMs;
@@ -512,6 +652,7 @@ function mergeArticles(existingArticles, newItems) {
         title: item.title,
         description: item.description,
         thumbnail: item.thumbnail,
+        guid: item.guid || null,
         publishedAt: item.publishedAt,
         publishedAtMs: item.publishedAtMs,
         sent: false,
@@ -531,6 +672,36 @@ function mergeArticles(existingArticles, newItems) {
   });
 
   return { articles, hasChanges };
+}
+
+function markPreviouslySentArticles(articles, sentMap) {
+  let mutated = false;
+
+  for (const article of articles) {
+    if (article.sent) {
+      continue;
+    }
+
+    const identity = getArticleIdentity(article);
+    if (!identity) {
+      continue;
+    }
+
+    const hash = hashIdentifier(identity);
+    const entry = sentMap.get(hash);
+    if (!entry) {
+      continue;
+    }
+
+    article.sent = true;
+    mutated = true;
+
+    if (!article.sentAt && entry.sentAt) {
+      article.sentAt = entry.sentAt;
+    }
+  }
+
+  return mutated;
 }
 
 
