@@ -10,6 +10,7 @@
  * 1. Environment Variables:
  *    - DISCORD_WEBHOOK_GNN: 巴哈姆特用 Webhook URL
  *    - DISCORD_WEBHOOK_4GAMERS: 4Gamers 用 Webhook URL
+ *    - DISCORD_WEBHOOK_PTT_STEAM: PTT 限免資訊用 Webhook URL
  * 2. KV Namespace Bindings:
  *    - RSS_CACHE: 儲存已處理的文章連結,避免重複推送
  *
@@ -25,7 +26,8 @@ const RSS_SOURCES = [
     baseUrl: 'https://gnn.gamer.com.tw',
     color: 0x009CAD,
     webhookEnv: 'DISCORD_WEBHOOK_GNN',
-    thumbnailStrategy: 'page'
+    thumbnailStrategy: 'page',
+    descriptionMaxLength: 120
   },
   {
     url: 'https://www.4gamers.com.tw/rss/latest-news',
@@ -34,6 +36,32 @@ const RSS_SOURCES = [
     color: 0x3A94CB,
     webhookEnv: 'DISCORD_WEBHOOK_4GAMERS',
     thumbnailStrategy: 'rss'
+  },
+  {
+    url: 'https://www.ptt.cc/atom/Steam.xml',
+    name: 'PTT Steam 限免',
+    baseUrl: 'https://www.ptt.cc',
+    color: 0x0066CC,
+    webhookEnv: 'DISCORD_WEBHOOK_PTT_STEAM',
+    thumbnailStrategy: 'none',
+    itemFilter: (item, context) => {
+      const title = typeof item.title === 'string' ? item.title : '';
+      if (title.includes('限免')) {
+        return true;
+      }
+
+      const descriptionText = typeof item.description === 'string' ? item.description : '';
+      if (descriptionText.includes('限免')) {
+        return true;
+      }
+
+      const descriptionHtml = context && typeof context.descriptionHtml === 'string'
+        ? context.descriptionHtml
+        : '';
+
+      return descriptionHtml.includes('限免');
+    },
+    buildPayload: article => ({ content: article.link || article.title || '限免資訊' })
   }
 ];
 
@@ -179,21 +207,46 @@ async function parseRSSItems(rssXml, source, targetDateKey) {
   const items = [];
   const seenLinks = new Set();
   const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
+  const entryRegex = /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi;
+  const filter = typeof source.itemFilter === 'function' ? source.itemFilter : null;
 
-  for (const match of rssXml.matchAll(itemRegex)) {
+  const rssMatches = Array.from(rssXml.matchAll(itemRegex)).map(match => ({ kind: 'rss', content: match[1] }));
+  const atomMatches = Array.from(rssXml.matchAll(entryRegex)).map(match => ({ kind: 'atom', content: match[1] }));
+  const records = rssMatches.length ? rssMatches : atomMatches;
+
+  for (const record of records) {
     if (items.length >= MAX_RSS_ITEMS) {
       break;
     }
 
-    const itemContent = match[1];
-    const title = extractTagValue(itemContent, 'title') || 'No Title';
-    const descriptionHtml = extractTagValue(itemContent, 'description');
-    const link = extractTagValue(itemContent, 'link');
-    const pubDate = extractTagValue(itemContent, 'pubDate');
-    const guid = extractTagValue(itemContent, 'guid');
-    const contentHtml =
-      extractTagValue(itemContent, 'content:encoded') ||
-      extractTagValue(itemContent, 'encoded');
+    const itemContent = record.content;
+
+    let title = 'No Title';
+    let descriptionHtml = '';
+    let link = '';
+    let pubDate = '';
+    let guid = '';
+    let contentHtml = '';
+
+    if (record.kind === 'atom') {
+      title = extractTagValue(itemContent, 'title') || 'No Title';
+      descriptionHtml = extractTagValue(itemContent, 'summary') || extractTagValue(itemContent, 'content') || '';
+      link = extractAtomLink(itemContent) || '';
+      pubDate = extractTagValue(itemContent, 'published') || extractTagValue(itemContent, 'updated') || '';
+      guid = extractTagValue(itemContent, 'id') || link;
+      contentHtml = descriptionHtml;
+    } else {
+      title = extractTagValue(itemContent, 'title') || 'No Title';
+      descriptionHtml = extractTagValue(itemContent, 'description');
+      link = extractTagValue(itemContent, 'link');
+      pubDate = extractTagValue(itemContent, 'pubDate');
+      guid = extractTagValue(itemContent, 'guid');
+      contentHtml =
+        extractTagValue(itemContent, 'content:encoded') ||
+        extractTagValue(itemContent, 'encoded');
+    }
+
+    const descriptionText = limitPlainText(cleanHtml(descriptionHtml || ''), source.descriptionMaxLength);
 
     const publishedAt = parsePubDate(pubDate);
     if (!publishedAt) {
@@ -227,15 +280,21 @@ async function parseRSSItems(rssXml, source, targetDateKey) {
       thumbnail = await extractThumbnailFromPage(link, source.baseUrl);
     }
 
-    items.push({
+    const nextItem = {
       title,
-      description: cleanHtml(descriptionHtml || ''),
+      description: descriptionText,
       link,
       guid,
       thumbnail,
       publishedAt: publishedAt.toISOString(),
       publishedAtMs: publishedAt.getTime()
-    });
+    };
+
+    if (filter && !filter(nextItem, { descriptionHtml, contentHtml })) {
+      continue;
+    }
+
+    items.push(nextItem);
   }
   
   return items;
@@ -374,6 +433,33 @@ function cleanHtml(html) {
   }
   
   return text;
+}
+
+function limitPlainText(text, maxLength) {
+  if (!Number.isFinite(maxLength) || maxLength <= 0) {
+    return text;
+  }
+
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  if (maxLength <= 3) {
+    return '.'.repeat(Math.max(1, maxLength));
+  }
+
+  const truncated = text.slice(0, maxLength - 3).trimEnd();
+  return `${truncated}...`;
+}
+
+function extractAtomLink(entryContent) {
+  const alternateMatch = /<link[^>]*rel=["']alternate["'][^>]*href=["']([^"']+)["'][^>]*>/i.exec(entryContent);
+  if (alternateMatch) {
+    return alternateMatch[1];
+  }
+
+  const anyMatch = /<link[^>]*href=["']([^"']+)["'][^>]*>/i.exec(entryContent);
+  return anyMatch ? anyMatch[1] : '';
 }
 
 function parsePubDate(pubDate) {
@@ -709,28 +795,39 @@ function markPreviouslySentArticles(articles, sentMap) {
  * 推送訊息到 Discord
  */
 async function sendToDiscord(webhookUrl, item, source) {
-  // 建立 embed 物件
-  const embed = {
-    title: item.title,
-    description: item.description,
-    url: item.link,
-    color: source.color,  // 使用來源的顏色
-    timestamp: item.publishedAt || new Date().toISOString(),
-    footer: {
-      text: source.name  // 顯示來源名稱
+  let payload = null;
+
+  if (typeof source.buildPayload === 'function') {
+    const customPayload = source.buildPayload(item, source);
+    if (customPayload && typeof customPayload === 'object') {
+      payload = customPayload;
     }
-  };
-  
-  // 如果有縮圖,加入到 embed (使用 image 欄位顯示大圖)
-  if (item.thumbnail) {
-    embed.image = {
-      url: item.thumbnail
+  }
+
+  if (!payload) {
+    // 建立 embed 物件
+    const embed = {
+      title: item.title,
+      description: item.description,
+      url: item.link,
+      color: source.color,  // 使用來源的顏色
+      timestamp: item.publishedAt || new Date().toISOString(),
+      footer: {
+        text: source.name  // 顯示來源名稱
+      }
+    };
+    
+    // 如果有縮圖,加入到 embed (使用 image 欄位顯示大圖)
+    if (item.thumbnail) {
+      embed.image = {
+        url: item.thumbnail
+      };
+    }
+    
+    payload = {
+      embeds: [embed]
     };
   }
-  
-  const payload = {
-    embeds: [embed]
-  };
   
   const response = await fetch(webhookUrl, {
     method: 'POST',
