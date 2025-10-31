@@ -30,7 +30,8 @@ const TAIPEI_OFFSET_MS = 8 * 60 * 60 * 1000; // UTC+8
 const DAILY_TIMEZONE = 'Asia/Taipei';
 const MAX_ITEMS_PER_SEND = 5;
 const MAX_RSS_ITEMS = 50;
-const SENT_MAP_TTL_SECONDS = 2 * 24 * 60 * 60;
+const SENT_MAP_TTL_SECONDS = 2 * 24 * 60 * 60; // 跨日去重資料保留 2 天
+const DAILY_STATE_TTL_SECONDS = 2 * 24 * 60 * 60; // 每日狀態資料保留 2 天
 
 export default {
   async fetch(request, env) {
@@ -774,7 +775,7 @@ async function loadDailyState(kv, source, dateKey) {
 
 async function saveDailyState(kv, key, state) {
   try {
-    await kv.put(key, JSON.stringify(state));
+    await kv.put(key, JSON.stringify(state), { expirationTtl: DAILY_STATE_TTL_SECONDS });
   } catch (error) {
     console.error('Failed to persist daily state:', error);
   }
