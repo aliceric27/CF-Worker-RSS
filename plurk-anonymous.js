@@ -26,6 +26,9 @@ const CONFIG = {
   PLURK_API_URL: "https://www.plurk.com/Stats/getAnonymousPlurks",
   PLURK_API_PARAMS: { lang: 'zh', limit: 50 },
   
+  // Hashtag 過濾設定
+  HASHTAG_FILTERS: ['FF14', '最終幻想14', 'FFXIV'],  // 只抓取包含這些 hashtag 的文章（區分大小寫）
+  
   // 分析設定
   ANALYSIS_WINDOW_HOURS: 12,  // 分析過去 12 小時的資料
   TOP_N_RESULTS: 5,            // 取前 5 名熱門噗文
@@ -237,6 +240,27 @@ function validateEnvironment(env) {
   }
 }
 
+/**
+ * 檢查噗文是否包含指定的 hashtag
+ * @param {object} plurk - 噗文物件
+ * @param {string[]} hashtags - 要搜尋的 hashtag 陣列
+ * @returns {boolean}
+ */
+function hasHashtag(plurk, hashtags) {
+  if (!plurk || !plurk.content) {
+    return false;
+  }
+  
+  // 檢查 content 欄位中是否包含 <span class="hashtag">#標籤</span> 格式
+  for (const tag of hashtags) {
+    const hashtagPattern = new RegExp(`<span class="hashtag">#${tag}</span>`, 'i');
+    if (hashtagPattern.test(plurk.content)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
 
 // -------------------------------------------------
 // 任務 A: 每小時執行，抓取並儲存資料
@@ -266,10 +290,21 @@ async function fetchAndStore(env, logger) {
       logger.warn('API 回應無有效噗文資料');
       return;
     }
+    
+    // 根據 hashtag 過濾噗文
+    const filteredPlurks = plurksArray.filter(plurk => hasHashtag(plurk, CONFIG.HASHTAG_FILTERS));
+    
+    logger.info('Hashtag 過濾結果', {
+      totalPlurks: plurksArray.length,
+      filteredPlurks: filteredPlurks.length,
+      filters: CONFIG.HASHTAG_FILTERS
+    });
 
+    // 即使沒有符合條件的文章，也要儲存空陣列到 KV
+    // 這樣可以區分「沒抓到資料」和「沒有符合條件的文章」兩種情況
     const now = new Date();
     const key = getKVKey(now);
-    const dataString = JSON.stringify(plurksArray);
+    const dataString = JSON.stringify(filteredPlurks);
     
     // 檢查資料大小
     const sizeKB = new Blob([dataString]).size / 1024;
@@ -282,7 +317,7 @@ async function fetchAndStore(env, logger) {
       expirationTtl: CONFIG.KV_TTL_SECONDS,
       metadata: {
         fetchedAt: now.toISOString(),
-        count: plurksArray.length,
+        count: filteredPlurks.length,
         sizeKB: Math.round(sizeKB)
       }
     });
@@ -290,7 +325,7 @@ async function fetchAndStore(env, logger) {
     const duration = Date.now() - startTime;
     logger.info('抓取任務完成', {
       key,
-      plurkCount: plurksArray.length,
+      plurkCount: filteredPlurks.length,
       sizeKB: sizeKB.toFixed(2),
       durationMs: duration
     });
@@ -366,7 +401,10 @@ async function processAndPost(env, logger) {
     const top5Plurks = findTopKPlurks(validResults, CONFIG.TOP_N_RESULTS, logger);
     
     if (top5Plurks.length === 0) {
-      logger.info('沒有找到值得發布的熱門話題');
+      logger.info('沒有找到符合 hashtag 條件的熱門話題，跳過發布', {
+        filters: CONFIG.HASHTAG_FILTERS,
+        dataHours: validResults.length
+      });
       return;
     }
     
