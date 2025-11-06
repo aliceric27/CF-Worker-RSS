@@ -30,8 +30,6 @@ const TAIPEI_OFFSET_MS = 8 * 60 * 60 * 1000; // UTC+8
 const DAILY_TIMEZONE = 'Asia/Taipei';
 const MAX_ITEMS_PER_SEND = 5;
 const MAX_RSS_ITEMS = 50;
-const SENT_MAP_TTL_SECONDS = 2 * 24 * 60 * 60; // 跨日去重資料保留 2 天
-const DAILY_STATE_TTL_SECONDS = 2 * 24 * 60 * 60; // 每日狀態資料保留 2 天
 
 export default {
   async fetch(request, env) {
@@ -77,7 +75,7 @@ async function processRSS(env, testMode = false) {
 
       const { key, state, exists } = await loadDailyState(kv, RSS_SOURCE, dateKey);
       const { key: sentKey, map: sentMap } = await loadSentMap(kv, RSS_SOURCE);
-      let sentMapDirty = pruneSentMap(sentMap);
+      let sentMapDirty = false;
 
       const response = await fetch(RSS_SOURCE.url);
       if (!response.ok) {
@@ -689,29 +687,13 @@ async function saveSentMap(kv, key, sentMap) {
     serializable[hash] = entry;
   }
   try {
-    await kv.put(key, JSON.stringify(serializable), { expirationTtl: SENT_MAP_TTL_SECONDS });
+    await kv.put(key, JSON.stringify(serializable)); // 永久保存，不設定 TTL
   } catch (error) {
     console.error('Failed to persist sent map:', error);
   }
 }
 
-function pruneSentMap(sentMap) {
-  const cutoffMs = Date.now() - SENT_MAP_TTL_SECONDS * 1000;
-  let mutated = false;
-  for (const [hash, entry] of sentMap.entries()) {
-    if (!entry || typeof entry.sentAt !== 'string') {
-      sentMap.delete(hash);
-      mutated = true;
-      continue;
-    }
-    const timestamp = Date.parse(entry.sentAt);
-    if (!Number.isFinite(timestamp) || timestamp < cutoffMs) {
-      sentMap.delete(hash);
-      mutated = true;
-    }
-  }
-  return mutated;
-}
+// 移除 pruneSentMap 函數，不再需要清理過期資料
 
 async function loadDailyState(kv, source, dateKey) {
   const key = buildDailyKey(source, dateKey);
@@ -775,7 +757,7 @@ async function loadDailyState(kv, source, dateKey) {
 
 async function saveDailyState(kv, key, state) {
   try {
-    await kv.put(key, JSON.stringify(state), { expirationTtl: DAILY_STATE_TTL_SECONDS });
+    await kv.put(key, JSON.stringify(state)); // 永久保存，不設定 TTL
   } catch (error) {
     console.error('Failed to persist daily state:', error);
   }
