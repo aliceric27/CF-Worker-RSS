@@ -29,6 +29,21 @@ async function processForum(env, testMode = false) {
 
   try {
     const sentKey = `sent:bahamut-forum`;
+    const lastRunKey = `lastrun:bahamut-forum`;
+
+    // 檢查上次執行時間 (除非是測試模式)
+    if (!testMode) {
+      const lastRunData = await kv.get(lastRunKey);
+      if (lastRunData) {
+        const lastRunTime = new Date(lastRunData);
+        const hoursSinceLastRun = (now - lastRunTime) / (1000 * 60 * 60);
+        
+        if (hoursSinceLastRun < 24) {
+          console.log(`距離上次執行僅 ${hoursSinceLastRun.toFixed(1)} 小時，跳過此次執行`);
+          return;
+        }
+      }
+    }
 
     // 獲取已發送記錄
     const sentData = await kv.get(sentKey);
@@ -72,6 +87,10 @@ async function processForum(env, testMode = false) {
       
       // 更新 KV
       await kv.put(sentKey, JSON.stringify(Object.fromEntries(sentMap)), { expirationTtl: 604800 });
+      
+      // 記錄執行時間
+      await kv.put(lastRunKey, now.toISOString(), { expirationTtl: 604800 });
+      
       console.log('文章已成功發送並記錄');
     }
   } catch (error) {
@@ -93,7 +112,15 @@ function parseArticles(html) {
     const titleMatch = /<p[^>]*class="b-list__main__title"[^>]*>([^<]+)<\/p>/.exec(mainContent);
     const briefMatch = /<p class="b-list__brief">([^<]+)<\/p>/.exec(mainContent);
     const thumbMatch = /data-thumbnail="([^"]+)"/.exec(mainContent);
-    const timeMatch = /<a[^>]*>(\d{2}-\d{2}\s+\d{2}:\d{2})<\/a>/.exec(timeContent);
+    
+    // 解析最後回覆時間
+    const lastReplyMatch = /<p class="b-list__time__edittime">[\s\S]*?>([^<]+)<\/a>/.exec(timeContent);
+    const lastReplyTime = lastReplyMatch ? lastReplyMatch[1].trim() : null;
+    
+    // 檢查是否超過一周
+    if (!isWithinOneWeek(lastReplyTime)) {
+      continue; // 跳過超過一周的文章
+    }
 
     // 解析統計數據
     const stats = parseStats(countContent);
@@ -110,7 +137,7 @@ function parseArticles(html) {
           brief: briefMatch ? briefMatch[1].replace(/&hellip;/g, '...').replace(/&nbsp;/g, ' ').trim() : '',
           link: `https://forum.gamer.com.tw/${relativeUrl}`,
           thumbnail: thumbMatch ? thumbMatch[1] : null,
-          time: timeMatch ? timeMatch[1] : null,
+          lastReplyTime: lastReplyTime,
           ...stats
         });
       }
@@ -118,6 +145,54 @@ function parseArticles(html) {
   }
 
   return articles;
+}
+
+function isWithinOneWeek(timeStr) {
+  if (!timeStr) return false;
+  
+  const now = new Date();
+  const oneWeekMs = 7 * 24 * 60 * 60 * 1000; // 一周的毫秒數
+  
+  // 解析各種時間格式
+  // 格式: "6 小時前", "2 天前", "1 週前", "12-25 10:30" 等
+  
+  // 處理相對時間
+  if (timeStr.includes('分鐘前') || timeStr.includes('小時前')) {
+    return true; // 幾分鐘或幾小時前肯定在一周內
+  }
+  
+  if (timeStr.includes('天前')) {
+    const days = parseInt(timeStr.match(/(\d+)\s*天前/)[1]);
+    return days < 7;
+  }
+  
+  if (timeStr.includes('週前') || timeStr.includes('周前')) {
+    const weeks = parseInt(timeStr.match(/(\d+)\s*[週周]前/)[1]);
+    return weeks < 1;
+  }
+  
+  if (timeStr.includes('月前') || timeStr.includes('年前')) {
+    return false; // 超過一個月或一年,肯定超過一周
+  }
+  
+  // 處理絕對時間格式 (MM-DD HH:mm)
+  const dateMatch = timeStr.match(/(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/);
+  if (dateMatch) {
+    const [, month, day, hour, minute] = dateMatch;
+    const articleDate = new Date(now.getFullYear(), parseInt(month) - 1, parseInt(day), parseInt(hour), parseInt(minute));
+    
+    // 如果日期在未來,表示是去年的日期
+    if (articleDate > now) {
+      articleDate.setFullYear(now.getFullYear() - 1);
+    }
+    
+    const diffMs = now - articleDate;
+    return diffMs < oneWeekMs;
+  }
+  
+  // 無法解析,保守起見認為在一周內
+  console.log('無法解析時間格式:', timeStr);
+  return true;
 }
 
 function parseStats(countContent) {
