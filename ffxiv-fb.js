@@ -3,16 +3,25 @@
  *
  * Features:
  * 1. Fetches RSS feed every 2 hours via Cron Trigger
- * 2. Persists unseen articles in KV to avoid duplicates
- * 3. Sends Discord embed notifications (oldest first)
+ * 2. Uses AI to optimize article titles and descriptions (Cloudflare Workers AI)
+ * 3. Dual KV storage with smart TTL management:
+ *    - Sent Map: 365 days TTL, max 500 entries (capacity-based pruning)
+ *    - Daily State: 30 days TTL (preserves AI-optimized content)
+ * 4. Sends Discord embed notifications (oldest first, max 5 per run)
+ * 5. Prevents duplicate sends even with irregular posting schedules
  *
  * Setup (Cloudflare Dashboard):
  * 1. Environment Variables:
  *    - FFXIV_WEBHOOK: Discord webhook URL for FFXIV feed
  * 2. KV Namespace Bindings:
- *    - RSS_CACHE: Stores processed article metadata
- * 3. Workers Cron Triggers:
- * 
+ *    - RSS_CACHE: Stores article metadata and sent history
+ * 3. Workers AI Bindings (optional, for title/description optimization):
+ *    - AI: Cloudflare Workers AI (@cf/openai/gpt-oss-120b)
+ *
+ * Storage Strategy:
+ * - Sent map only prunes when exceeding 500 entries (removes oldest by sentAt)
+ * - No time-based pruning to prevent duplicate sends during low-activity periods
+ * - 500 entries ≈ 5 years of history at 2 posts/week
  */
 
 const RSS_SOURCE = {
@@ -30,6 +39,9 @@ const TAIPEI_OFFSET_MS = 8 * 60 * 60 * 1000; // UTC+8
 const DAILY_TIMEZONE = 'Asia/Taipei';
 const MAX_ITEMS_PER_SEND = 5;
 const MAX_RSS_ITEMS = 50;
+const SENT_MAP_TTL_SECONDS = 365 * 24 * 60 * 60; // 365 天 (KV 自動過期的安全網)
+const DAILY_STATE_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 天
+const MAX_SENT_MAP_SIZE = 500; // 最多保留 500 筆記錄 (主要清理機制)
 
 export default {
   async fetch(request, env) {
@@ -75,7 +87,7 @@ async function processRSS(env, testMode = false) {
 
       const { key, state, exists } = await loadDailyState(kv, RSS_SOURCE, dateKey);
       const { key: sentKey, map: sentMap } = await loadSentMap(kv, RSS_SOURCE);
-      let sentMapDirty = false;
+      let sentMapDirty = pruneSentMap(sentMap); // 清理過期記錄
 
       const response = await fetch(RSS_SOURCE.url);
       if (!response.ok) {
@@ -687,13 +699,43 @@ async function saveSentMap(kv, key, sentMap) {
     serializable[hash] = entry;
   }
   try {
-    await kv.put(key, JSON.stringify(serializable)); // 永久保存，不設定 TTL
+    await kv.put(key, JSON.stringify(serializable), { expirationTtl: SENT_MAP_TTL_SECONDS });
   } catch (error) {
     console.error('Failed to persist sent map:', error);
   }
 }
 
-// 移除 pruneSentMap 函數，不再需要清理過期資料
+function pruneSentMap(sentMap) {
+  let mutated = false;
+
+  // 清理無效的記錄
+  for (const [hash, entry] of sentMap.entries()) {
+    if (!entry || typeof entry.sentAt !== 'string') {
+      sentMap.delete(hash);
+      mutated = true;
+      continue;
+    }
+    const timestamp = Date.parse(entry.sentAt);
+    if (!Number.isFinite(timestamp)) {
+      sentMap.delete(hash);
+      mutated = true;
+    }
+  }
+
+  // 若超過容量上限，刪除最舊的記錄 (基於 sentAt 時間)
+  if (sentMap.size > MAX_SENT_MAP_SIZE) {
+    const sorted = Array.from(sentMap.entries())
+      .sort((a, b) => Date.parse(a[1].sentAt) - Date.parse(b[1].sentAt));
+    const toDelete = sorted.slice(0, sentMap.size - MAX_SENT_MAP_SIZE);
+    for (const [hash] of toDelete) {
+      sentMap.delete(hash);
+    }
+    mutated = true;
+    console.log(`Pruned ${toDelete.length} old entries from sent map (exceeded ${MAX_SENT_MAP_SIZE} limit)`);
+  }
+
+  return mutated;
+}
 
 async function loadDailyState(kv, source, dateKey) {
   const key = buildDailyKey(source, dateKey);
@@ -757,7 +799,7 @@ async function loadDailyState(kv, source, dateKey) {
 
 async function saveDailyState(kv, key, state) {
   try {
-    await kv.put(key, JSON.stringify(state)); // 永久保存，不設定 TTL
+    await kv.put(key, JSON.stringify(state), { expirationTtl: DAILY_STATE_TTL_SECONDS });
   } catch (error) {
     console.error('Failed to persist daily state:', error);
   }
