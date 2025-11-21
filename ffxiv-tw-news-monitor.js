@@ -37,8 +37,8 @@ const CATEGORY_ICONS = {
 // 分類顏色映射
 const CATEGORY_COLORS = {
   '活動': 0xd9912b,  // 橘色 #d9912b
-  '維修': 0xFFD93D,  // 黃色
-  '維護': 0xFFD93D,  // 黃色（同義詞）
+  '維修': 0x993d3d,  // 紅色 #993d3d
+  '維護': 0x993d3d,  // 紅色 #993d3d（同義詞）
   '公告': 0x6BCF7F,  // 綠色
   '更新': 0x6b993d,  // 深綠色 #6b993d
   '其他': 0xcccccc   // 淺灰色 #cccccc
