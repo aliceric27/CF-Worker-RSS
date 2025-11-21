@@ -54,20 +54,13 @@ function sleep(ms) {
 }
 
 /**
- * 格式化觀看數（加入千分位）
- */
-function formatViews(views) {
-  return views.toLocaleString('en-US');
-}
-
-/**
  * 解析日期字串為 ISO 8601 格式
  * @param {string} dateString - "2025-11-18" 格式
  * @returns {string} ISO 8601 格式的日期字串
  */
 function parseDate(dateString) {
-  // API 回傳的日期格式是 "YYYY-MM-DD"，假設為台灣時區的日期
-  // 轉換為 UTC 時間（台灣時間 00:00 = UTC 前一天 16:00）
+  // API 回傳的日期格式是 "YYYY-MM-DD"
+  // 這裡簡化處理為「UTC 該日的 00:00」，僅用於 Discord 顯示時間
   const [year, month, day] = dateString.split('-').map(Number);
   const date = new Date(year, month - 1, day, 0, 0, 0);
   return date.toISOString();
@@ -138,11 +131,12 @@ function collectAllArticles(categories) {
 async function loadSnapshot(env) {
   try {
     const data = await env.RSS_CACHE.get(KV_SNAPSHOT_KEY, { type: 'json' });
-    if (!data || !data.articleIds) {
+    if (!data || !Array.isArray(data.articleIds)) {
       return [];
     }
     return data.articleIds;
   } catch (error) {
+    console.error('✗ 快照載入失敗:', error.message);
     return [];
   }
 }
@@ -182,6 +176,7 @@ async function loadSentMap(env) {
     }
     return new Map(Object.entries(data));
   } catch (error) {
+    console.error('✗ sent map 載入失敗:', error.message);
     return new Map();
   }
 }
@@ -193,7 +188,7 @@ async function saveSentMap(env, sentMap) {
   try {
     // 容量管理：如果超過 500 筆，刪除最舊的記錄
     if (sentMap.size > MAX_SENT_MAP_SIZE) {
-      await pruneSentMap(sentMap);
+      pruneSentMap(sentMap);
     }
 
     // 轉換 Map 為 Object
@@ -213,7 +208,7 @@ async function saveSentMap(env, sentMap) {
 /**
  * 清理 sent map，保留最新的 500 筆記錄
  */
-async function pruneSentMap(sentMap) {
+function pruneSentMap(sentMap) {
   // 轉換為陣列並按 sentAt 排序
   const entries = Array.from(sentMap.entries());
   entries.sort((a, b) => {
@@ -267,9 +262,6 @@ async function fetchArticleDescription(url) {
           // 當遇到新的 <p> 標籤時，儲存前一個段落
           if (currentParagraphText && paragraphs.length < 3) {
             paragraphs.push(currentParagraphText);
-            currentParagraphText = '';
-          } else if (!currentParagraphText) {
-            // 重置，準備收集下一個段落
             currentParagraphText = '';
           }
         }
@@ -388,7 +380,7 @@ async function processFFXIVNews(env, testMode = false) {
 
     // 2. 從 KV 讀取新聞資料
     const newsData = await loadNewsFromKV(env);
-    const allArticles = collectAllArticles(newsData.categories);
+    const allArticles = collectAllArticles(newsData.categories || {});
     const currentIds = allArticles.map(article => article.id);
 
     // 3. 載入快照（上次的完整 ID 清單）
@@ -400,8 +392,8 @@ async function processFFXIVNews(env, testMode = false) {
     }
 
     // 4. 比對快照，找出新增的文章 ID
-    const newIds = currentIds.filter(id => !previousIds.includes(id));
-    const newArticles = allArticles.filter(article => newIds.includes(article.id));
+    const previousIdSet = new Set(previousIds);
+    const newArticles = allArticles.filter(article => !previousIdSet.has(article.id));
 
     if (newArticles.length === 0) {
       console.log(`✓ 無新文章 (${allArticles.length} 篇)`);
@@ -428,7 +420,8 @@ async function processFFXIVNews(env, testMode = false) {
     // 8. 處理文章（首次執行只記錄，不發送）
     let successCount = 0;
 
-    for (const article of articlesToProcess) {
+    for (let index = 0; index < articlesToProcess.length; index++) {
+      const article = articlesToProcess[index];
       if (isFirstRun) {
         // 首次執行：只記錄 ID，不發送
         sentMap.set(article.id, {
@@ -450,7 +443,7 @@ async function processFFXIVNews(env, testMode = false) {
           successCount++;
 
           // 避免 Discord rate limit
-          if (articlesToProcess.indexOf(article) < articlesToProcess.length - 1) {
+          if (index < articlesToProcess.length - 1) {
             await sleep(1000);
           }
         }
@@ -479,7 +472,7 @@ async function processFFXIVNews(env, testMode = false) {
 // ==================== Worker 進入點 ====================
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // 測試端點: 手動觸發
@@ -548,7 +541,7 @@ export default {
     });
   },
 
-  async scheduled(event, env, ctx) {
+  async scheduled(controller, env, ctx) {
     ctx.waitUntil(processFFXIVNews(env, false)); // testMode = false
   }
 };
